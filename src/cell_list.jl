@@ -1,11 +1,11 @@
 using Base.Threads, LinearAlgebra
 
-export npairs, nsites, max_neigs, max_neighbours, neigs, neighbours
+export npairs, nsites, maxneigs, max_neighbours, neigs, neighbours, neigs!
 
 PairList(X::Vector{SVec{T}}, cutoff::AbstractFloat, cell::AbstractMatrix, pbc;
-            int_type::Type = Int, store_first = true, sorted = true, fixcell = true) where {T} =
-   _pairlist_(X, SMat{T}(cell), SVec{Bool}(pbc), T(cutoff), zero(int_type),
-              store_first, sorted, fixcell)
+            int_type::Type = Int32, fixcell = true) where {T} =
+   _pairlist_(X, SMat{T}(cell), SVec{Bool}(pbc), T(cutoff), int_type,
+              fixcell)
 
 PairList(X::Matrix{T}, args...; kwargs...) where {T} =
    PairList(reinterpret(SVec{T}, X, (size(X,2),)), args...; varargs...)
@@ -28,15 +28,16 @@ end
 @inline bin_wrap(i::Integer, pbc::Bool, n::Integer) = pbc ? bin_wrap(i, n) : i
 
 "Map i back to the interval [0,n) by assigning edge value if outside interval"
-@inline function bin_trunc(i::Integer, n::Integer)
-   if i <= 0;     i = 1
+@inline function bin_trunc(i::TI, n::TI) where {TI <: Integer}
+   if i <= 0;     i = TI(1)
    elseif i > n;  i = n
    end
    return i
 end
 
 "apply bin_trunc only if open bdry"
-@inline bin_trunc(i::Integer, pbc::Bool, n::Integer) = pbc ? i : bin_trunc(i, n)
+@inline bin_trunc(i::TI, pbc::Bool, n::TI) where {TI <: Integer} =
+      pbc ? TI(i) : bin_trunc(i, n)
 
 "applies bin_trunc to open bdry and bin_wrap to periodic bdry"
 @inline bin_wrap_or_trunc(i::Integer, pbc::Integer, n::Integer) =
@@ -55,8 +56,9 @@ end
 # @inline Base.sub2ind(dims::NTuple{3,TI}, i::SVec{TI}) where {TI <: Integer} =
 #    sub2ind(dims, i[1], i[2], i[3])
 # WARNING: this smells like a performance regression!
+# WARNING: `LinearIndices` always returnsstores Int, not TI!!!
 @inline _sub2ind(dims::NTuple{3,TI}, i::SVec{TI}) where {TI <: Integer} =
-   (LinearIndices(dims))[i[1], i[2], i[3]]
+   TI( (LinearIndices(dims))[i[1], i[2], i[3]] )
 
 lengths(C::SMat{T}) where {T} =
    det(C) ./ SVec{T}(norm(C[2,:]×C[3,:]), norm(C[3,:]×C[1,:]), norm(C[1,:]×C[2,:]))
@@ -64,7 +66,8 @@ lengths(C::SMat{T}) where {T} =
 
 # --------------------------------------------------------------------------
 
-function analyze_cell(cell, cutoff, _::TI) where {TI <: Integer}
+function analyze_cell(cell, cutoff, TI)
+   @assert TI <: Integer
    # check the cell volume (allow only 3D volumes!)
    volume = abs(det(cell))
    if volume < 1e-12
@@ -85,7 +88,7 @@ end
 
 # multi-threading setup
 
-function setup_mt(niter::TI, maxnt = MAX_THREADS[1]) where TI
+function setup_mt(niter::TI, maxnt = MAX_THREADS[1]) where TI <: Integer
    nt = minimum([6, nthreads(), ceil(TI, niter / 20), maxnt])
    # nn = ceil.(TI, linspace(1, niter+1, nt+1))
    # range(start, stop=stop, length=length)
@@ -97,11 +100,11 @@ end
 
 
 function _celllist_(X::Vector{SVec{T}}, cell::SMat{T}, pbc::SVec{Bool},
-            cutoff::T, _i::TI) where {T <: AbstractFloat, TI <: Integer}
-
+            cutoff::T, TI) where {T <: AbstractFloat}
+   @assert TI <: Integer
    # ----- analyze cell -----
    nat = length(X)
-   inv_cell, ns_vec, lens = analyze_cell(cell, cutoff, _i)
+   inv_cell, ns_vec, lens = analyze_cell(cell, cutoff, TI)
    ns = ns_vec.data
 
    if prod(BigInt.(ns_vec)) > typemax(TI)
@@ -124,7 +127,7 @@ function _celllist_(X::Vector{SVec{T}}, cell::SMat{T}, pbc::SVec{Bool},
       # Periodic/non-periodic boundary conditions
       c = bin_wrap_or_trunc.(c, pbc, ns_vec)
       # linear cell index  # (+1 due to 1-based indexing)
-      ci = _sub2ind(ns, c)   # <<<<
+      ci = _sub2ind(ns, c)
 
       # Put atom into appropriate bin (list of linked lists)
       if seed[ci] < 0   #  ci contains no atom yet
@@ -150,7 +153,7 @@ function _pairlist_(clist::CellList{T, TI}) where {T, TI}
          clist.X, clist.cell, clist.pbc, clist.cutoff,
          clist.seed, clist.last, clist.next
    nat = length(X)
-   inv_cell, ns_vec, lens = analyze_cell(cell, cutoff, one(TI))
+   inv_cell, ns_vec, lens = analyze_cell(cell, cutoff, TI)
 
    # guess how many neighbours per atom
    #    atoms in cell x (8 cells) * (ball / cube)
@@ -163,15 +166,13 @@ function _pairlist_(clist::CellList{T, TI}) where {T, TI}
    # allocate arrays
    first_t = Vector{TI}[ Vector{TI}()  for n = 1:nt ]    # i
    secnd_t = Vector{TI}[ Vector{TI}()  for n = 1:nt ]    # j
-   absdist_t = Vector{T}[ Vector{T}()  for n = 1:nt ]  # r_ij ~ norm(X[i]-X[j])
-   distvec_t = Vector{SVec{T}}[ Vector{SVec{T}}()  for n = 1:nt ]  # ~ X[i] - X[j]
+   shift_t = Vector{SVec{TI}}[ Vector{SVec{TI}}()  for n = 1:nt ]  # ~ X[i] - X[j]
    # give size hints
    sz = (nat ÷ nt + nt) * nneigs_guess
    for n = 1:nt
       sizehint!(first_t[n], sz)
       sizehint!(secnd_t[n], sz)
-      sizehint!(absdist_t[n], sz)
-      sizehint!(distvec_t[n], sz)
+      sizehint!(shift_t[n], sz)
    end
 
    # We need the shape of the bin ( bins[:, i] = cell[i,:] / ns[i] )
@@ -182,14 +183,18 @@ function _pairlist_(clist::CellList{T, TI}) where {T, TI}
    nxyz = ceil.(TI, cutoff * (ns_vec ./ lens))
    # cxyz = CartesianIndex(nxyz.data)
    # WARNING : 3D-specific hack; also potential performance regression
-   xyz_range = CartesianIndices((-nxyz[1]:nxyz[1], -nxyz[2]:nxyz[2], -nxyz[3]:nxyz[3]))
+   # WARNING: `CartesianIndices` always stores Int, not TI!!!
+   xyz_range = CartesianIndices((-nxyz[1]:nxyz[1],
+                                 -nxyz[2]:nxyz[2],
+                                 -nxyz[3]:nxyz[3]))
 
    # Loop over threads
-   @threads for it = 1:nt
+   # @threads for it = 1:nt
+   for it = 1:nt
       for i = nn[it]:(nn[it+1]-1)
          # current atom position
          _find_neighbours_!(i, clist, ns_vec, bins, xyz_range,
-                     first_t[it], secnd_t[it], absdist_t[it], distvec_t[it])
+                      first_t[it], secnd_t[it], shift_t[it])
       end # for i = 1:nat
    end # @threads
 
@@ -197,23 +202,21 @@ function _pairlist_(clist::CellList{T, TI}) where {T, TI}
    sz = sum( length(first_t[i]) for i = 1:nt )
    first = first_t[1];     sizehint!(first, sz)
    secnd = secnd_t[1];     sizehint!(secnd, sz)
-   absdist = absdist_t[1]; sizehint!(absdist, sz)
-   distvec = distvec_t[1]; sizehint!(distvec, sz)
+   shift = shift_t[1]; sizehint!(shift, sz)
    for it = 2:nt
       append!(first, first_t[it])
       append!(secnd, secnd_t[it])
-      append!(absdist, absdist_t[it])
-      append!(distvec, distvec_t[it])
+      append!(shift, shift_t[it])
    end
 
    # Build return tuple
-   return first, secnd, absdist, distvec
+   return first, secnd, shift
 end
 
 
 
 function _find_neighbours_!(i, clist, ns_vec::SVec{TI}, bins, xyz_range,
-                            first, secnd, absdist, distvec) where TI
+                            first, secnd, shift) where TI
    inv_cell, X, pbc = clist.inv_cell, clist.X, clist.pbc
    seed, last, next = clist.seed, clist.last, clist.next
    xi = X[i]
@@ -234,13 +237,13 @@ function _find_neighbours_!(i, clist, ns_vec::SVec{TI}, bins, xyz_range,
    # Apply periodic boundary conditions as well now
    ci = bin_wrap_or_trunc.(ci0, pbc, ns_vec)
 
-   for ixyz in xyz_range
+   for ixyz in xyz_range  # Integer
       # convert cartesian index to SVector
       xyz = SVec{TI}(ixyz.I)
       # get the bin index
       cj = bin_wrap.(ci + xyz, pbc, ns_vec)
       # skip this bin if not inside the domain
-      all(1 .<= cj .<= ns_vec) || continue
+      all(TI(1) .<= cj .<= ns_vec) || continue
       # linear cell index
       ncj = _sub2ind(ns_vec.data, cj)
       # Offset of the neighboring bins
@@ -263,14 +266,13 @@ function _find_neighbours_!(i, clist, ns_vec::SVec{TI}, bins, xyz_range,
             dxj = xj - bins * (cj - 1)
             # Compute distance between atoms
             dx = dxj - dxi + off
-            norm_dx_sq = dx ⋅ dx
+            norm_dx_sq = dot(dx, dx)
 
             # append to the list
             if norm_dx_sq < cutoff_sq
                push!(first, i)
                push!(secnd, j)
-               push!(distvec, dx)
-               push!(absdist, sqrt(norm_dx_sq))
+               push!(shift, (ci0 - cj + xyz) .÷ ns_vec)
             end
          end  # if i != j || any(xyz .!= 0)
 
@@ -282,27 +284,20 @@ end
 
 
 function _pairlist_(X::Vector{SVec{T}}, cell::SMat{T}, pbc::SVec{Bool},
-            cutoff::T, _i::TI, store_first::Bool, sorted::Bool, fixcell::Bool) where {T, TI}
-
+            cutoff::T, TI, fixcell::Bool) where {T}
+   @assert TI <: Integer
    # temporary (?) fix to make sure all atoms are within the cell
    if fixcell
       X, cell = _fix_cell_(X, cell, pbc)
    end
 
-   clist = _celllist_(X, cell, pbc, cutoff, _i)
-   i, j, r, R = _pairlist_(clist)
+   clist = _celllist_(X, cell, pbc, cutoff, TI)
+   i, j, S = _pairlist_(clist)
 
-   if store_first
-      first = get_first(i, length(X))
-   else
-      first = zeros(int_type, 0)
-   end
+   first = get_first(i, length(X))
+   sort_neigs!(j, (S,), first)
 
-   if store_first && sorted
-      sort_neigs!(j, r, R, first)
-   end
-
-   return PairList(X, cutoff, i, j, r, R, first)
+   return PairList(X, cell, cutoff, i, j, S, first)
 end
 
 
@@ -341,12 +336,12 @@ end
 
 
 """
-`sort_neigs!(j, r, R, first)`
+`sort_neigs!(j, arrays, first)`
 
 sorts each sub-range of `j` corresponding to one site  in ascending order
 and applies the same permutation to `r, R, S`.
 """
-function sort_neigs!(j, r, R, first)
+function sort_neigs!(j, arrays::Tuple, first)
    nat = length(first) - 1
    nt, nn = setup_mt(nat)
    @threads for it = 1:nt
@@ -358,24 +353,15 @@ function sort_neigs!(j, r, R, first)
                I = sortperm(j[rg])
                rg_perm = rg[I]
                j[rg] = j[rg_perm]
-               r[rg] = r[rg_perm]
-               R[rg] = R[rg_perm]
+               for a in arrays
+                  a[rg] .= a[rg_perm]
+               end
             end
          end
       end
    end
 end
 
-"""
-`max_neigs(nlist::PairList) -> Integer`
-
-returns the maximum number of neighbours that any atom in the
-neighbourlist has.
-"""
-function max_neigs(nlist::PairList)
-      maximum( nlist.first[n+1]-nlist.first[n]
-               for n = 1:(length(nlist.first)-1) )
-end
 
 """
 `_fix_cell_(X::Vector{SVec{T}}, C::SMat{T}, pbc)`
@@ -429,21 +415,97 @@ function _fix_cell_(X::Vector{SVec{T}}, C::SMat{T}, pbc) where {T}
 end
 
 """
-`neigs(nlist, i) -> j, r, R`
+`maxneigs(nlist::PairList) -> Integer`
+
+returns the maximum number of neighbours that any atom in the
+neighbourlist has.
+"""
+maxneigs(nlist::PairList) = maximum( nneigs(nlist, n) for n = 1:nsites(nlist) )
+
+# retire max_neigs
+const max_neigs = maxneigs
+
+"""
+`nneigs(nlist::PairList, i0::Integer) -> Integer` :
+return number of neighbours of particle with index `i0`.
+(within cutoff radius + buffer)
+"""
+nneigs(nlist::PairList, i0::Integer) = nlist.first[i0+1]-nlist.first[i0]
+
+function _getR(nlist, idx)
+   i = nlist.i[idx]
+   j = nlist.j[idx]
+   return _getR(nlist.X[j] - nlist.X[i], nlist.S[idx], nlist.C)
+end
+
+_getR(dX::SVec, S::SVec, C::SMat) = dX + C' * S
+
+"""
+`neigs!(Rtemp, nlist, i) -> j, R`
 
 For `nlist::PairList` this returns the interaction neighbourhood of
 the atom indexed by `i`. E.g., in the standard loop approach one
 would have
 ```
-for (i, j, r, R) in sites(nlist)
-   (j, r, R) == neigs(nlist, i)
+Rtemp = zeros(JVecF, maxneigs(nlist))
+for (i, j, R) in sites(nlist)
+   (j, R) == neigs(nlist, i) == neigs!(Rtemp, nlist, i)
 end
 ```
+
+`R` is a view into `Rtemp` with the correct length, while `j` is a view
+into `nlist.j`.
 """
-function neigs(nlist::PairList, i::Integer)
-   Ineigs = nlist.first[i]:(nlist.first[i+1]-1)
-   return nlist.j[Ineigs], nlist.r[Ineigs], nlist.R[Ineigs]
+function neigs!(Rs::AbstractVector{<: SVec}, nlist::PairList, i0::Integer)
+   n1, n2 = nlist.first[i0], nlist.first[i0+1]-1
+   _grow_array!(Rs, n2-n1+1)
+   J = (@view nlist.j[n1:n2])
+   for n = 1:length(J)
+      Rs[n] = _getR(nlist, n1+n-1)
+   end
+   return J, (@view Rs[1:length(J)])
 end
+
+function neigs!(Js::AbstractVector{<: SVec},
+                Rs::AbstractVector{<: SVec},
+                nlist::PairList, i0::Integer)
+   _grow_array!(Rs, n2-n1+1)
+   _grow_array!(Js, n2-n1+1)
+   j, Rs = neigs!(Rs, nlist, i0)
+   N = length(j)
+   copyto!(Js, j)
+   return (@view Js[1:length(j)]), Rs
+end
+
+function _grow_array!(A::Vector{T}, N) where {T}
+   if length(A) < N
+      append!(A, zeros(T, N-length(A)))
+   end
+   return A
+end
+
+"""
+`neigss!(Rs, nlist, i0) -> j, R, S` : return neighbourhood as in
+`neigs!` as well as the corresponding cell shifts.
+
+(`R` is a view into `Rs` with the correct length)
+"""
+function neigss!(Rs::AbstractVector{<: SVec}, nlist::PairList, i0::Integer)
+   n1, n2 = nlist.first[i0], nlist.first[i0+1]-1
+   _grow_array!(Rs, n2-n1+1)
+   J = (@view nlist.j[n1:n2])
+   for n = 1:length(J)
+      Rs[n] = _getR(nlist, n1+n-1)
+   end
+   return J, (@view Rs[1:length(J)]), (@view nlist.S[n1:n2])
+end
+
+
+neigs(nlist::PairList{T}, i0::Integer) where {T} =
+      neigs!( zeros(SVec{T}, nneigs(nlist, i0)), nlist, i0 )
+
+neigss(nlist::PairList{T}, i0::Integer) where {T} =
+      neigss!( zeros(SVec{T}, nneigs(nlist, i0)), nlist, i0 )
 
 """
 alias for `neigs`
@@ -453,4 +515,4 @@ neighbours = neigs
 """
 alias for `max_neigs`
 """
-max_neighbours = max_neigs
+max_neighbours = maxneigs
